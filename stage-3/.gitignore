@@ -1,0 +1,7 @@
+review_intake
+*.o
+__pycache__/
+.ropenv/
+ropenv/
+core
+core.*
