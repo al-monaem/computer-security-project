@@ -1,154 +1,125 @@
 # Stage 1 — Classic stack buffer overflow with injected shellcode (x86-64)
 
-A minimal vulnerable program that reads a file into an oversized stack buffer
-with no bounds checking. A crafted payload overflows the buffer, overwrites the
-saved return address, and redirects execution into benign machine code placed on
-the stack. This is the baseline attack — **code injection on an executable
-stack** — that later stages (NX, ROP, ASLR) are defined against.
+The baseline attack the whole project is defined against: **code injection on an
+executable stack.** A crafted overflow overwrites a function's saved return
+address so that, when the function returns, the CPU jumps into attacker-supplied
+machine code sitting on the stack and runs it.
 
-> ⚠️ **Educational use only.** The target program is intentionally vulnerable.
-> Build and run it only on your own machine (e.g. the SEED Labs VM), for
-> learning. Do not deploy it.
+This stage introduces the program the whole project is built on
+(`review_intake.c`), compiled here with the stack left **executable**
+(`-z execstack`). That is deliberate: Stages 1 → 2 → 3 all attack this *same*
+program, and the *only* thing that changes between them is the defense.
+
+| Stage | NX (stack) | Technique | Result |
+|-------|------------|-----------|--------|
+| **1 (here)** | **OFF** | inject shellcode on the stack, return into it | shell |
+| 2 | ON | *same* exploit, re-run | SIGSEGV |
+| 3 | ON | ROP / ret2libc (reuse existing code) | shell |
+
+> ⚠️ **Educational use only.** `review_intake.c` is intentionally vulnerable.
+> Build and run it only inside your own Linux VM (e.g. SEED Labs). Do not deploy
+> it.
 
 ---
 
 ## 1. The idea in one paragraph
 
-`vulnerable()` declares a 64-byte `buffer` and then `memcpy`s up to 256 bytes of
-attacker-controlled file data into it with no length check. By writing past the
-end of `buffer` we reach the saved return address further up the stack. We
-replace that address with the address of our own bytes — a tiny instruction
-sequence we placed at the start of the buffer. When `vulnerable()` returns, the
-CPU jumps into our bytes and executes them. The stack is compiled executable
-(`-z execstack`), so the injected code is allowed to run.
+`submit_review()` declares a 64-byte `comment` buffer, then `read()`s up to 256
+bytes into it with no bounds check. By writing past the end of `comment` we reach
+the saved return address higher up the stack and replace it with the address of
+the buffer itself — where we have placed real `execve("/bin/sh")` shellcode. When
+`submit_review()` returns, execution lands in our bytes on the stack and runs
+them. Because this stage is compiled with an **executable stack**
+(`-z execstack`), the injected code is allowed to execute, and we get a shell.
 
-The injected code here is deliberately harmless: `mov eax, 42; ret`. Seeing
-`rax = 0x2a` (42) after the return proves our bytes executed.
+Payload layout:
+
+```
+[ execve("/bin/sh") shellcode ][ 0x90 padding ... ][ saved-RA -> comment buffer ]
+  ~44 bytes                      up to offset 88      8 bytes (little-endian)
+```
 
 ---
 
-## 2. Files
+## 2. Hitting the exact stack address (why this uses gdb)
 
-| File                   | What it is                                                               |
-|------------------------|--------------------------------------------------------------------------|
-| `shellcode_overflow.c` | The intentionally vulnerable program (unbounded `memcpy` into a buffer). |
-| `generate_payload.py`  | Builds `shellcode_payload.bin`: injected code + padding + return address.|
-| `Makefile`             | Builds the target with canary off, PIE off, executable stack.            |
-| `.gitignore`           | Keeps the compiled binary and generated payload out of git.              |
+The hard part of the classic attack is knowing the buffer's **exact runtime
+address**. It shifts with the process environment and `argv[0]`, so an address
+measured under one launch is stale under another — with ASLR off each launch is
+deterministic, but different launchers lay the stack out differently.
 
-The payload layout (`generate_payload.py`):
+**`exploit_stack.py` sidesteps the guessing entirely**: it runs the target
+*under gdb* (`gdb.debug`), breaks inside `submit_review`, and
+reads the **live** address of `comment` and the **live** saved-return-address
+slot from the very process it then exploits. Nothing is hardcoded and no address
+is predicted — it is measured in-place, so the jump is exact.
 
-```
-[ mov eax,42; ret ][ 0x90 padding ... ][ saved-RA -> buffer_address ]
- 6 bytes            up to offset (88)    8 bytes (little-endian)
-= 96 bytes total
-```
-
-`offset = 88` is the distance from the start of `buffer` to the saved return
-address; `buffer_address = 0x7fffffffdf30` is where the buffer lives in the
-recorded GDB run.
+The overflow offset (distance from `comment` to the saved return address) is
+**88**; the script derives it from gdb's frame info each run, so it survives
+recompiles.
 
 ---
 
-## 3. Build and generate the payload
+## 3. Files
 
-Run these inside your Ubuntu SEED Labs VM, in your Stage 1 directory:
-
-```bash
-cd ~/stack-overflow-project/stage1
-
-gcc -g -O0 -fno-stack-protector \
-    -fno-omit-frame-pointer -no-pie \
-    -z execstack \
-    -o shellcode_overflow shellcode_overflow.c
-
-python3 generate_payload.py
-```
-
-Or, equivalently, with the Makefile:
-
-```bash
-make
-make payload
-```
-
-Check that the stack is executable:
-
-```bash
-readelf -W -l shellcode_overflow | grep GNU_STACK   # or: make checkstack
-```
-
-Expected permission flags: **RWE**.
+| File | What it is |
+|------|------------|
+| `review_intake.c` | The vulnerable program — the project's baseline, reused unchanged by Stages 2–3; built NX-off here. |
+| `Makefile` | Builds x86-64 with canary off, PIE off, **executable stack**; `make checksec` prints the protections. |
+| `exploit_stack.py` | Injects `execve("/bin/sh")` and returns into the stack buffer (live gdb-measured address) → interactive shell. |
+| `.gitignore` | Keeps the compiled binary and corefiles out of git. |
 
 ---
 
-## 4. GDB demonstration
-
-Start GDB:
+## 4. Setup
 
 ```bash
-gdb ./shellcode_overflow
+# 64-bit toolchain is standard on a 64-bit Ubuntu/SEED VM (build-essential).
+# pwntools: either the system package or a venv.
+sudo apt install -y python3-pwntools        # simplest on SEED/Kali
+# or:  python3 -m venv ropenv && ropenv/bin/pip install pwntools
 ```
-
-Inside GDB:
-
-```gdb
-break *0x401316
-run shellcode_payload.bin
-```
-
-Inspect the saved return address:
-
-```gdb
-x/gx $rsp
-```
-
-In the recorded run, the expected result was:
-
-```
-0x7fffffffdf88: 0x00007fffffffdf30
-```
-
-Inspect the injected instructions:
-
-```gdb
-x/2i 0x7fffffffdf30
-```
-
-Then execute the return and inspect the registers:
-
-```gdb
-si
-info registers rip rax
-```
-
-In the original GDB session, PEDA stepped through the injected `mov`
-instruction, producing:
-
-```
-rip  0x7fffffffdf35
-rax  0x2a
-```
-
-`0x2a` is 42 in decimal, confirming execution of the injected code. Depending on
-GDB's stepping behavior, you may need another `si` before inspecting the
-registers.
 
 ---
 
-## 5. Environment-specific values
+## 5. Build and run
 
-The addresses below are from the original build and debugger session. **Verify
-them if you recompile or change the environment** — the stack address in
-particular will differ, and the payload's `buffer_address` must be updated to
-match.
+```bash
+cd stage-1
+make                 # builds the target; prints the NX/canary/PIE summary
+python3 exploit_stack.py
+```
 
-| Value             | Where it comes from                        |
-|-------------------|--------------------------------------------|
-| `0x401316`        | Breakpoint: the `ret` in `vulnerable()`.   |
-| `0x7fffffffdf30`  | Address of `buffer` (payload target).      |
-| `0x7fffffffdf88`  | Location of the saved return address.      |
-| `offset = 88`     | Distance from `buffer` to the saved RA.    |
+Confirm the stack really is executable (this is what makes Stage 1 work):
 
-If the stack address changes, re-read `buffer`'s address in GDB and update
-`buffer_address` in `generate_payload.py`.
+```bash
+make checksec
+# NX (stack)  : DISABLED (stack executable)  <-- enables Stage 1 shellcode injection
+```
+
+`exploit_stack.py` launches the target under gdb, so it needs a terminal for the
+gdb window — run it from the SEED **desktop terminal**, or inside `tmux`, or set
+`context.terminal = ['gnome-terminal', '--']` near the top of the script.
+
+Expected: it prints the measured offset and the live `comment` address, sends the
+payload, and drops you at a `$` prompt. Try `id`, `uname -a`, `cat /etc/hostname`.
+
+---
+
+## 6. How this connects to the next stages
+
+Rebuild this **same source** with NX on (via `-z noexecstack`) and re-run
+`exploit_stack.py`: the jump into the stack now faults with **SIGSEGV** instead
+of giving a shell — that is Stage 2, and it needs no new code, only the flag
+change. To get a shell again under NX you must stop injecting code and start
+reusing it: that is Stage 3's ROP / ret2libc chain — the same overflow, aimed at
+existing executable code instead of at bytes on the stack.
+
+---
+
+## 7. Environment notes
+
+- The offset and buffer address are **measured at runtime** (via gdb), so you do
+  not need to edit anything after recompiling.
+- Verified on a 64-bit SEED Ubuntu 20.04 VM (glibc 2.31) with the stack mapped
+  `rwxp`. Everything here is meant to run inside an isolated Linux VM.
