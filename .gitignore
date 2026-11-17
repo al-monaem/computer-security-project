@@ -1,0 +1,16 @@
+# Compiled vulnerable binaries (rebuilt per stage with `make`)
+review_intake
+
+# Build intermediates
+*.o
+
+# Python / pwntools
+__pycache__/
+
+# Virtual environments (e.g. ROP tooling)
+.ropenv/
+ropenv/
+
+# Core dumps from the intentional crashes
+core
+core.*
