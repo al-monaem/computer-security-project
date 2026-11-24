@@ -1,0 +1,483 @@
+% =====================================================================
+%  From Stack Smashing to Code Reuse  --  Final Project Report
+%  Two-column conference-paper style on the stock `article` class.
+%  (IEEEtran is not required; this compiles with a standard TeX Live.)
+%
+%  Build:   pdflatex report.tex && pdflatex report.tex
+%     or:   latexmk -pdf report.tex
+% =====================================================================
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[letterpaper,margin=0.75in,columnsep=0.28in]{geometry}
+\usepackage{newtxtext,newtxmath}   % Times text + math
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage[labelsep=period]{caption}
+\usepackage{titlesec}
+\usepackage{balance}
+\usepackage[hidelinks]{hyperref}
+
+% ---- IEEE-ish sectioning: I. SECTION, A. Subsection -------------------
+\renewcommand{\thesection}{\Roman{section}}
+\renewcommand{\thesubsection}{\Alph{subsection}}
+\titleformat{\section}{\centering\normalsize\bfseries\scshape}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\itshape}{\thesubsection.}{0.5em}{}
+\titlespacing*{\section}{0pt}{10pt}{4pt}
+\titlespacing*{\subsection}{0pt}{6pt}{2pt}
+
+% ---- table / caption look --------------------------------------------
+\captionsetup{font=small,labelfont=sc}
+\captionsetup[table]{position=top}
+\setlist[itemize]{leftmargin=1.2em,itemsep=1pt,topsep=2pt,parsep=0pt}
+
+% ---- code listings ----------------------------------------------------
+\definecolor{cmt}{RGB}{90,110,90}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  commentstyle=\color{cmt},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},
+  xleftmargin=2pt,xrightmargin=2pt,
+  aboveskip=4pt,belowskip=2pt,
+}
+\lstdefinestyle{py}{language=Python,morecomment=[l]\#}
+\lstdefinestyle{c}{language=C}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+% =====================================================================
+\begin{document}
+
+% ---- Full-width title band (spans both columns) ----------------------
+\twocolumn[{%
+  \begin{center}
+    {\LARGE\bfseries From Stack Smashing to Code Reuse:\\[2pt]
+     A Reproducible Study of the Stack Buffer Overflow\\ and the NX, ASLR, and Canary Defenses\par}
+    \vspace{8pt}
+    {\large Al Monaem Khan \quad Juan Reynosa \quad David Duru\par}
+    \vspace{3pt}
+    {\itshape Department of Computer Science, Computer Security (Fall 2026)\par}
+    \vspace{2pt}
+    {\small\url{https://github.com/al-monaem/computer-security-project}\par}
+    \vspace{14pt}
+  \end{center}
+}]
+
+% ---- Abstract + index terms begin column 1 ---------------------------
+\noindent\textbf{\textit{Abstract}---We present a reproducible teaching study
+that follows one vulnerability class, the stack buffer overflow, through its
+history of attack and defense. We attack a single deliberately vulnerable C
+program three ways, changing only its compile-time defenses between runs. In
+Stage~1 we inject machine code onto an executable stack and redirect control
+into it (x86-64). In Stage~2 we enable the NX bit, show the same exploit
+faulting, and recover execution with a return-to-libc call into
+\code{system("/bin/sh")}. In Stage~3 we keep NX enabled and build a
+Return-Oriented Programming (ROP) chain that assembles an \code{execve} syscall
+by hand from four gadgets, then extend it to defeat ASLR with an information
+leak and to re-enable execution at runtime through an \code{mprotect} chain
+(x86-32). Because only one variable changes between stages, each result isolates
+the effect of a single mitigation. The experiments show that no one defense is
+enough on its own, which is why modern systems combine several.}
+
+\vspace{4pt}
+\noindent\textbf{\textit{Index Terms}---}\textit{stack buffer overflow,
+control-flow hijacking, NX/DEP, return-to-libc, return-oriented programming,
+ASLR, defense-in-depth.}
+\vspace{6pt}
+
+% =====================================================================
+\section{Introduction}
+
+\subsection{Problem Statement}
+Memory-corruption bugs are among the oldest and most studied software
+vulnerabilities, and the stack buffer overflow is the canonical
+example~\cite{alephone}. When a program copies attacker-controlled input into a
+fixed-size stack buffer without checking its length, the excess bytes overwrite
+adjacent stack data, most importantly the saved return address. By controlling
+that address, an attacker redirects the program's control flow to code of their
+choosing. This work asks a focused question: given one such bug, what does it
+take to exploit it, and what does each modern defense actually prevent?
+
+\subsection{Motivation}
+Stack overflows have caused serious real-world incidents. The 1988 Morris Worm,
+the first large-scale internet worm, spread in part by overflowing a fixed-size
+stack buffer in the Unix \code{fingerd} daemon, which read network input with
+the unbounded \code{gets()} function~\cite{alephone}; it reached roughly 10\% of
+the ${\sim}60{,}000$ hosts then online and led to the first CERT Coordination
+Center. The same bug class was still doing damage decades later: the 2017
+EternalBlue exploit (CVE-2017-0144) triggered a buffer overflow in Microsoft's
+SMBv1 service~\cite{cve}, and the WannaCry ransomware built on it reached more
+than 200{,}000 systems across about 150 countries. NX, ASLR, and stack
+canaries, the defenses studied here, were introduced in response to attacks
+like these~\cite{pax,stackguard}.
+
+\subsection{Contributions}
+This paper makes the following contributions:
+\begin{itemize}
+  \item A single vulnerable program attacked across three configurations, so
+    each experiment isolates the effect of exactly one defense (Table~\ref{tab:stages}).
+  \item A verified classic injection on an executable stack with a
+    runtime-measured offset (Stage~1).
+  \item A demonstration that the NX bit converts the same exploit into a crash,
+    and that return-to-libc routes around it (Stage~2).
+  \item A verified ROP suite (a four-gadget \code{execve} chain, an ASLR
+    information-leak bypass, and an \code{mprotect} runtime W\^{}X bypass), plus
+    an analysis of why each residual defense would have raised the bar (Stage~3).
+\end{itemize}
+
+\subsection{Scope}
+The work targets x86 Linux. Stages~1 and~2 use an x86-64 build of the target;
+the Stage~3 ROP prototype uses a 32-bit (x86-32) build so that syscall arguments
+are passed on the stack, keeping the gadget layout simple to teach. All testing
+is confined to an isolated SEED Ubuntu VM~\cite{seed} with harmless payloads.
+Out of scope: networked or third-party targets, weaponized payloads, heap
+corruption, and non-x86 architectures.
+
+% =====================================================================
+\section{Background and Related Work}
+The foundational references map directly onto our stages. Aleph One's
+``Smashing the Stack for Fun and Profit''~\cite{alephone} documents the classic
+injection attack reproduced in Stage~1. Solar Designer's return-to-libc
+technique~\cite{solar} is reproduced in Stage~2, and Shacham's generalization to
+Return-Oriented Programming~\cite{rop} is the basis of Stage~3. The defenses
+correspond to the PaX project's NX and ASLR work~\cite{pax} and to StackGuard
+for canaries~\cite{stackguard}. The SEED Labs~\cite{seed} provide the standard
+pedagogical environment we build on.
+
+Existing tutorials typically demonstrate one technique against one binary. Our
+contribution is methodological: we attack the \emph{same} program across all
+stages and change only the build flags between them, so each result is a
+controlled before/after that isolates a single mitigation, which most
+single-technique writeups cannot show. A few terms recur below: a \emph{gadget}
+is a short existing instruction sequence ending in \code{ret}; a ROP
+\emph{chain} strings gadget addresses on the stack so each \code{ret} invokes
+the next; W\^{}X / NX means a page is writable or executable but not both.
+
+% =====================================================================
+\section{Threat Model and Security Requirements}
+
+\subsection{System Overview}
+The target is \code{review\_intake.c}, a small command-line ``Product Review
+Intake'' tool. Its \code{submit\_review()} function declares a 64-byte
+\code{comment} buffer and fills it with an unchecked
+\code{read(fd, comment, 256)}. This is one believable defect: a buffer sized at
+64 bytes but read up to 256. The same source is compiled under different flags
+per stage.
+
+\subsection{Assets and Adversary}
+\textbf{Assets.} The integrity of the process's control flow (saved return
+addresses and instruction pointer) and, in turn, the confidentiality and
+availability of the host. \textbf{Threat actor.} An attacker who can supply
+input to the program but holds no legitimate code-execution privilege and, in
+the baseline case, cannot read the victim's memory map directly. In the ASLR
+scenario the attacker additionally observes program output, which enables the
+information leak.
+
+\subsection{Attack Surface and Threats}
+\begin{itemize}
+  \item Unvalidated input copied into a fixed-size stack buffer (the
+    overflow), which is the entry point.
+  \item The saved return address as the control-flow hijack point.
+  \item Injected shellcode on an executable stack; once NX forbids that,
+    existing libc code reused as a single function (ret2libc) or as chained
+    gadgets (ROP).
+\end{itemize}
+
+\subsection{Assumptions and Requirements}
+We assume the attacker controls only program input and that the defender
+compiles with standard mitigations; for teaching, specific mitigations are
+disabled per stage and ASLR is toggled at the OS level. The security
+requirement is an \textbf{integrity} property on control flow: attacker input
+must not lead to execution of attacker-chosen behavior. That property underpins
+the confidentiality and availability of the host. We examine how NX, ASLR, canaries,
+and PIE each contribute, and where each fails alone.
+
+% =====================================================================
+\section{Design, Methods, and Implementation}
+
+\subsection{Overall Design}
+One vulnerable program is paired with a tool per stage that runs it under a
+specific defense configuration. Compiler and linker flags turn the relevant
+protection on or off, so the binary is deterministic and each stage isolates a
+single variable. The three stages form an attack/defense arc, summarized in
+Table~\ref{tab:stages}.
+
+\begin{table*}[t]
+  \centering
+  \caption{The three stages attack the same program; only the defense changes between them.}
+  \label{tab:stages}
+  \small
+  \begin{tabularx}{\textwidth}{@{}c l X X@{}}
+    \toprule
+    \textbf{Stage} & \textbf{NX (stack)} & \textbf{Technique} & \textbf{Result}\\
+    \midrule
+    1 & OFF & Inject shellcode onto the stack, return into it (x86-64) & Shell / hijack confirmed\\
+    2 & ON  & Same exploit re-run $\rightarrow$ fails; then return-to-libc into \code{system("/bin/sh")} & SIGSEGV, then shell via reuse\\
+    3 & ON  & Full ROP chain (\code{execve} from 4 gadgets); + ASLR leak; + \code{mprotect} (x86-32) & Shell despite NX and ASLR\\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+\subsection{Tools and Technologies}
+\begin{itemize}
+  \item \textbf{GCC} (with \code{-m32} for the 32-bit target) on an isolated
+    SEED Ubuntu 20.04 VM (glibc 2.31).
+  \item \textbf{GDB} for stack inspection and step-by-step verification of the
+    hijack; \code{readelf}/\code{objdump} for binary inspection.
+  \item \textbf{pwntools}~\cite{pwntools} for exploit scripting and
+    \textbf{ROPgadget}~\cite{ropgadget} for gadget discovery; 32-bit toolchain
+    via \code{gcc-multilib}, \code{libc6-dev-i386}.
+\end{itemize}
+
+\subsection{Build Configurations}
+Each stage compiles the identical source with flags that leave every protection
+on except the ones that would make the lesson impossible to observe
+(Table~\ref{tab:builds}). Critically, only one flag
+(\code{-z execstack}~$\rightarrow$~\code{-z noexecstack}) separates Stage~1 from
+Stage~2.
+
+\begin{table*}[t]
+  \centering
+  \caption{Per-stage build. Only the NX flag differs between Stage~1 and Stage~2; ASLR is toggled at the OS level (\code{setarch -R} / pwntools).}
+  \label{tab:builds}
+  \small
+  \begin{tabularx}{\textwidth}{@{}c c c c c X@{}}
+    \toprule
+    \textbf{Stage} & \textbf{Arch} & \textbf{NX (stack)} & \textbf{Canary} & \textbf{PIE} & \textbf{Key flags}\\
+    \midrule
+    1 & x86-64 & OFF & off & off & \code{-z execstack, -fno-stack-protector, -no-pie}\\
+    2 & x86-64 & ON  & off & off & \code{-z noexecstack} (one flag flipped)\\
+    3 & x86-32 & ON  & off & off & \code{-m32, -z noexecstack, -fno-stack-protector, -no-pie}\\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+\subsection{The Planted Vulnerability}
+The single vulnerability, identical across all stages:
+\begin{lstlisting}[style=c]
+static void submit_review(void) {
+  char comment[64];     /* fixed buffer: the bug */
+  ...
+  int n = read(STDIN_FILENO, comment, 256);
+}
+\end{lstlisting}
+\noindent Using \code{read()} (not \code{scanf}/\code{fgets}) matters: it copies
+raw bytes of any value, including NUL, so arbitrary addresses survive the copy.
+
+\subsection{Stage 1: Classic Injection (x86-64)}
+Built with \code{-z execstack}, so the stack is mapped \code{rwxp}. The exploit
+avoids guessing the buffer's runtime address: it launches the target under GDB,
+breaks inside \code{submit\_review}, and reads the live address of
+\code{comment} and the live saved-return-address slot from the very process it
+then exploits. The measured offset is 88 bytes (\code{comment} at
+\code{[rbp-0x50]}, return address at \code{[rbp+8]}). The payload is
+\code{execve} shellcode, NOP padding, then the little-endian address of the
+buffer itself:
+\begin{lstlisting}[style=py]
+payload  = shellcode              # execve("/bin/sh")
+payload += b'\x90'*(off-len(sc))  # pad to offset 88
+payload += p64(comment_addr)      # saved RA -> buffer
+\end{lstlisting}
+\noindent GDB confirmed RIP entered the injected bytes.
+
+\subsection{Stage 2: NX Blocks Injection; ret2libc Recovers It (x86-64)}
+\fbox{\parbox{0.95\columnwidth}{\footnotesize\textbf{Status (placeholder).} The
+Stage~2 implementation and its captured evidence (the Stage~1 payload re-run
+under NX, GDB output, and the finalized x86-64 ret2libc run) are being finalized
+for the demonstration. The design below is settled; captured results will be
+added to Table~\ref{tab:results}.}}
+
+\vspace{4pt}
+Stage~2 rebuilds the same source with a single flag flipped,
+\code{-z noexecstack} (NX on), and shows two things. \textbf{(a) The defense
+works:} the exact Stage~1 payload now faults with \code{SIGSEGV} the instant the
+CPU tries to fetch the injected bytes. NX is enforcing W\^{}X here, with no
+source change. \textbf{(b) Code reuse defeats NX:} instead of injecting code, the
+return address is redirected into an existing libc function, with a fake frame
+supplying its argument:
+\begin{lstlisting}[style=py]
+payload  = b'A'*OFFSET   # pad to saved RA
+payload += p32(system)   # ret INTO system()
+payload += p32(exit)     # system()'s return addr
+payload += p32(binsh)    # arg -> "/bin/sh"
+\end{lstlisting}
+\noindent Nothing on the stack executes as code, so NX never fires. (Shown in
+the 32-bit argument layout; the x86-64 variant loads the argument into RDI via a
+\code{pop rdi; ret} gadget.) This is the split the project turns on: NX stops
+\textbf{injection} but not \textbf{reuse}, which is what motivates the general
+technique in Stage~3.
+
+\subsection{Stage 3: Full ROP, ASLR Bypass, mprotect (x86-32)}
+Stage~3 uses a 32-bit build (stack-passed syscall arguments keep the layout
+teachable). The offset, 84 bytes, is found with a cyclic De Bruijn pattern. The
+main exploit builds the \code{execve("/bin/sh",0,0)} syscall by hand from four
+gadgets:
+\begin{lstlisting}[style=py]
+payload  = b'A'*OFFSET
+payload += p32(pop_ecx_edx)+p32(0)+p32(0) # ecx,edx=0
+payload += p32(pop_ebx)+p32(binsh)        # ebx=&sh
+payload += p32(pop_eax)+p32(0xb)          # eax=11
+payload += p32(int80)                     # int 0x80
+\end{lstlisting}
+\noindent Each \code{ret} pops the next gadget's address; every instruction that
+runs lives inside libc, which is legitimately executable, so NX has nothing to
+object to. Two further prototypes extend the idea:
+\begin{itemize}
+  \item \textbf{Defeating ASLR.} With ASLR on, a first stage calls
+    \code{puts()} on a GOT entry to leak a real libc address, computes the base
+    (\code{libc.address = leaked\_puts - sym['puts']}), and sends the chain
+    resolved against it. It succeeds on repeated runs, each with a different
+    base.
+  \item \textbf{Runtime W\^{}X bypass.} A ROP chain calls \code{mprotect()} to
+    mark a page RWX, then jumps into shellcode placed there. This shows NX can
+    be undone at runtime given the right callable function.
+\end{itemize}
+
+% =====================================================================
+\section{Experimental Evaluation and Results}
+
+\subsection{Setup and Methodology}
+All tests run on an isolated SEED Ubuntu 20.04 VM (glibc 2.31), x86-64 host with
+32-bit multilib. ASLR is disabled per-process where a deterministic address is
+needed (\code{aslr=False} / \code{setarch -R}) and explicitly enabled for the
+ASLR-bypass test. Each binary's protections are confirmed with
+\code{make checksec} before exploitation. We (i) confirm the build, (ii) measure
+the offset empirically rather than assuming it equals the buffer size, and (iii)
+deliver the payload and verify the outcome: register/RIP state in GDB for a
+hijack, a live shell (\code{id}, \code{uname -m}) for success, or the expected
+\code{SIGSEGV} for the defense. Results are summarized in
+Table~\ref{tab:results}.
+
+\begin{table*}[t]
+  \centering
+  \caption{Results summary. Stage~1 and all Stage~3 experiments are verified in the VM; Stage~2 is designed and its captured evidence is being finalized.}
+  \label{tab:results}
+  \small
+  \begin{tabularx}{\textwidth}{@{}l l X l@{}}
+    \toprule
+    \textbf{Experiment} & \textbf{Config} & \textbf{Outcome} & \textbf{Status}\\
+    \midrule
+    S1: inject shellcode on stack & NX off, x86-64 & Offset 88; GDB confirms RIP in injected code (test: RAX=0x2a); hijack & Verified\\
+    S2(a): re-run S1 payload & NX on, x86-64 & Faults with SIGSEGV; NX blocks stack execution & In progress\\
+    S2(b): return-to-libc & NX on & One jump into \code{system("/bin/sh")} yields a shell & In progress\\
+    S3: 4-gadget \code{execve} ROP & NX on, x86-32 & Chain assembles \code{execve}; shell obtained; ret2libc cousin also works & Verified\\
+    S3: ASLR info-leak & NX on, ASLR on & \code{puts()} leak recovers libc base; succeeds across runs & Verified\\
+    S3: \code{mprotect} chain & NX on, x86-32 & Page marked RWX, shellcode runs; shell obtained & Verified\\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+\subsection{Security Evaluation}
+Table~\ref{tab:defenses} states, for each defense, what it is and how it bears
+on these exploits, including the ones we deliberately left off so the lesson
+stays visible.
+
+\begin{table*}[t]
+  \centering
+  \caption{Each mitigation raises the cost of exploitation but is individually bypassable; only fixing the unbounded write removes the vulnerability.}
+  \label{tab:defenses}
+  \small
+  \begin{tabularx}{\textwidth}{@{}l X X@{}}
+    \toprule
+    \textbf{Defense} & \textbf{What it is} & \textbf{Effect on these exploits}\\
+    \midrule
+    NX / DEP & Stack pages non-executable (W\^{}X). & Stops Stage~1 injection (S2a). Does \emph{not} stop reuse; ret2libc and ROP run only existing code.\\
+    Stack canary & Random guard before the saved RA, checked on return. & A linear overflow smashes it; the check aborts before \code{ret}, so the RA is never controlled. Would stop all stages as built.\\
+    ASLR & Randomizes libc load address each run. & Breaks hard-coded addresses. Bypassed in S3 only via an information leak.\\
+    PIE & Randomizes the program image too. & Moves in-binary gadgets, raising the bar for ROP further.\\
+    Safe APIs & \code{read(buf, sizeof buf)}; bounds checks. & The overflow never happens; this removes the bug instead of only raising its cost.\\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+\subsection{Analysis}
+Flipping one flag turns a working exploit into a crash, which isolates NX's
+contribution. Return-to-libc and ROP then recover execution without placing any
+code where NX would object, so on its own NX is necessary but not sufficient.
+The ASLR experiment adds the next layer: fixed addresses stop being reliable,
+and that layer also falls to an information leak, which is why real systems add
+canaries and PIE as well. We measured the offsets (88 bytes on x86-64, 84 on
+x86-32) rather than assuming them, because the compiler reserves frame space
+beyond the 64-byte buffer. None of these mitigations stopped exploitation on its
+own, which is why production systems combine them.
+
+% =====================================================================
+\section{Discussion, Limitations, and Conclusion}
+
+\subsection{Limitations}
+Several mitigations are deliberately disabled per stage for pedagogy; this is not
+a hardened production build, and demo addresses are deterministic only because
+ASLR is toggled for teaching. The Stage~3 ROP prototype is 32-bit for layout
+simplicity rather than matching the x86-64 Stage~1/2 target, and the Stage~2
+captured evidence is still being assembled. We do not treat heap corruption,
+canaries in practice, jump-oriented programming, or control-flow integrity in
+depth.
+
+\subsection{Future Work}
+\begin{itemize}
+  \item Finalize the Stage~2 evidence and re-target the ROP prototype to the
+    x86-64 binary.
+  \item Add canary-enabled and PIE-enabled builds to show the overflow caught
+    and gadget addresses moving.
+  \item Explore jump-oriented programming and a basic CFI demonstration as the
+    next defense layer.
+\end{itemize}
+
+\subsection{Conclusion}
+Attacking one program three ways, changing only its defenses, puts the whole arc
+in one place. The classic overflow works when the stack is executable; NX turns
+the same attack into a crash; code reuse routes around NX; and ASLR, the next
+layer, falls to an information leak. No single mitigation stops exploitation by
+itself, so real systems combine them, and the durable fix is to remove the
+unbounded write that starts the chain.
+
+% =====================================================================
+\begin{thebibliography}{9}
+\small
+\bibitem{alephone} Aleph One, ``Smashing the Stack for Fun and Profit,''
+  \emph{Phrack}, vol.~7, no.~49, 1996.
+\bibitem{solar} Solar Designer, ``Return-to-libc Attack,'' Bugtraq mailing
+  list, 1997.
+\bibitem{rop} H.~Shacham, ``The Geometry of Innocent Flesh on the Bone:
+  Return-into-libc without Function Calls (on the x86),'' in \emph{Proc. ACM
+  CCS}, 2007.
+\bibitem{stackguard} C.~Cowan et al., ``StackGuard: Automatic Adaptive
+  Detection and Prevention of Buffer-Overflow Attacks,'' in \emph{Proc. USENIX
+  Security}, 1998.
+\bibitem{pax} The PaX Team, ``PaX: NOEXEC and ASLR Documentation,''
+  \url{https://pax.grsecurity.net/}.
+\bibitem{seed} W.~Du, ``SEED Labs: Buffer Overflow and Return-to-libc Attack
+  Labs,'' \url{https://seedsecuritylabs.org/}.
+\bibitem{cve} MITRE, ``CVE-2017-0144 (EternalBlue / SMBv1 buffer overflow).''
+\bibitem{pwntools} Gallopsled, ``pwntools: CTF framework and exploit
+  development library,'' \url{https://github.com/Gallopsled/pwntools}.
+\bibitem{ropgadget} J.~Salwan, ``ROPgadget: gadget finder,''
+  \url{https://github.com/JonathanSalwan/ROPgadget}.
+\end{thebibliography}
+
+\balance
+\section*{Appendix: Team Contributions}
+\begin{itemize}
+  \item \textbf{Juan Reynosa}, Stage~1 (classic injection, x86-64): build
+    configuration, payload construction, and GDB hijack verification.
+  \item \textbf{David Duru}, Stage~2 (NX protection + return-to-libc):
+    enabling NX on the x86-64 build, showing the Stage~1 payload fail under NX,
+    and the ret2libc workaround.
+  \item \textbf{Al Monaem Khan}, Stage~3 (ROP, x86-32): the vulnerable
+    application, the four-gadget \code{execve} chain, the ASLR information-leak
+    bypass, and the \code{mprotect} chain.
+\end{itemize}
+
+\end{document}

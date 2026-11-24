@@ -14,3 +14,12 @@ ropenv/
 # Core dumps from the intentional crashes
 core
 core.*
+
+# LaTeX build intermediates (latex/)
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+latex/pg-*.jpg
