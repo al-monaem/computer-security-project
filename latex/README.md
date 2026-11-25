@@ -1,8 +1,9 @@
 # LaTeX build of the final report
 
-A two-column, conference-paper rendering of the final report
+A two-column, conference-paper rendering of the project report
 (*From Stack Smashing to Code Reuse*). Same content as the top-level
-`Fall2026_Final Project Report.docx`, in an IEEE-style layout.
+`Fall2026_Interim Project Report_From Stack Smashsing to Code Reuse.pdf`,
+in an IEEE-style layout.
 
 It uses the stock `article` class with a custom preamble (Times via
 `newtxtext`, `booktabs`, `listings`, `hyperref`), so **IEEEtran is not
