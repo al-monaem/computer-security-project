@@ -23,3 +23,12 @@ core.*
 *.fls
 *.fdb_latexmk
 latex/pg-*.jpg
+
+# Node deps + slide render artifacts (presentation/)
+node_modules/
+package.json
+package-lock.json
+presentation/*.pdf
+presentation/slide-*.jpg
+presentation/ss-thumbs*.jpg
+presentation/original-theme.pptx.bak

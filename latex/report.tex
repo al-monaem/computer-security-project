@@ -214,6 +214,19 @@ protection on or off, so the binary is deterministic and each stage isolates a
 single variable. The three stages form an attack/defense arc, summarized in
 Table~\ref{tab:stages}.
 
+The repository mirrors this structure with one directory per stage. Each
+directory holds the same vulnerable source, a \code{Makefile} that encodes that
+stage's protections, and the exploit scripts that act on the resulting binary.
+Stage~1 contains \code{review\_intake.c}, its \code{Makefile}, and
+\code{exploit\_stack.py}. The Stage~3 directory adds \code{find\_offset.py} (the
+offset finder), \code{nx\_shellcode\_fails.py} (the blocked-injection control),
+\code{exploit.py} (the gadget chain), \code{exploit\_ret2libc.py} (the single
+reused function), \code{exploit\_hardcoded.py} (the same chain with frozen
+addresses, which fails under ASLR), \code{exploit\_aslr.py} (the leak-based
+bypass), and \code{exploit\_mprotect.py} (the runtime permission flip). A
+\code{make checksec} target in each \code{Makefile} prints the binary's actual
+protections so every run can be tied to a known configuration.
+
 \begin{table*}[t]
   \centering
   \caption{The three stages attack the same program; only the defense changes between them.}
@@ -229,6 +242,38 @@ Table~\ref{tab:stages}.
     \bottomrule
   \end{tabularx}
 \end{table*}
+
+\subsection{The Vulnerable Application}
+The target is deliberately ordinary. \code{review\_intake.c} is a command-line
+product-review tool with a menu loop: submit a review, list stored reviews, or
+quit. Submitting a review calls \code{submit\_review()}, which declares the
+64-byte \code{comment} buffer alongside a few other locals (a product name, a
+rating, and a short line buffer), prints prompts, and then reads the review
+text. Every other input in the program is read with a bounded helper; the single
+unbounded read is the planted defect. Keeping the program realistic matters for
+the lesson: the bug is one believable mistake in otherwise normal code, not a
+contrived harness.
+
+When \code{submit\_review()} is entered, the compiler lays out its frame with the
+buffer low and the saved control data high, as in Table~\ref{tab:frame}. Writing
+past the end of \code{comment} walks upward through the other locals and the
+saved frame pointer until it reaches the saved return address, which is the slot
+every stage overwrites.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Address} & \textbf{Contents} & \textbf{Role}\\
+\midrule
+high & saved return addr & hijack target\\
+     & saved \code{rbp}/\code{ebp} & frame pointer\\
+     & other locals / padding & frame fill\\
+low  & \code{comment[64]} & overflow source\\
+\bottomrule
+\end{tabular}
+\captionof{table}{Frame of \code{submit\_review()}: the overflow climbs from the buffer to the saved return address.}
+\label{tab:frame}
+\end{center}
 
 \subsection{Tools and Technologies}
 \begin{itemize}
@@ -264,6 +309,30 @@ Stage~2.
   \end{tabularx}
 \end{table*}
 
+\subsection{Design Decisions and Trade-offs}
+Several choices shape the study, and each is deliberate. The protections are
+disabled selectively rather than wholesale. A build with every modern defense
+turned on would stop the bug at the first stage and show nothing, so each stage
+leaves every protection on except the one it is there to examine. The stack
+canary is off because a canary sits between the buffer and the saved return
+address and is checked on return; a linear overflow would smash it and abort the
+program before the \code{ret}, so leaving it off is what exposes the return
+address as a target. Its effect is not ignored, only moved to the analysis in
+Section~\ref{sec:results}. PIE is off so that the program image, and with it the
+PLT, the GOT, and any in-binary gadgets, load at fixed addresses that stay stable
+across runs; with PIE on, those would move as well and obscure the single
+variable under study.
+
+The 32-bit choice for Stage~3 is also deliberate. On x86-32 the syscall arguments
+are passed in registers loaded from the stack, which keeps the gadget sequence
+and its data short enough to read on a slide or in a table. The cost is that
+Stage~3 is a separate prototype rather than a one-flag change from Stage~2, which
+the paper states plainly; re-targeting the chain to the x86-64 binary is listed
+as future work. Finally, the vulnerability is a single believable defect in
+otherwise ordinary code, and every payload is harmless and run only inside an
+isolated virtual machine, so the demonstrations teach the mechanism without
+providing a weapon or touching any system the authors do not own.
+
 \subsection{The Planted Vulnerability}
 The single vulnerability, identical across all stages:
 \begin{lstlisting}[style=c]
@@ -273,24 +342,69 @@ static void submit_review(void) {
   int n = read(STDIN_FILENO, comment, 256);
 }
 \end{lstlisting}
-\noindent Using \code{read()} (not \code{scanf}/\code{fgets}) matters: it copies
-raw bytes of any value, including NUL, so arbitrary addresses survive the copy.
+\noindent The buffer holds 64 bytes, but \code{read()} accepts up to 256. Using
+\code{read()} rather than \code{scanf} or \code{fgets} matters for two reasons.
+First, it copies raw bytes of any value, including NUL and whitespace, so the
+attacker can place arbitrary 4- or 8-byte addresses that those formatted readers
+would truncate. Second, it performs no length check of its own, so the overflow
+is reachable with ordinary input. The fix is equally small: bound the count to
+the buffer, \code{read(fd, comment, sizeof comment - 1)}, which is the control
+case the study contrasts against.
+
+\subsection{Measuring the Overflow Offset}
+No stage assumes the distance from the buffer to the saved return address equals
+the buffer size; the compiler reserves frame space beyond the 64 bytes for other
+locals and alignment, so the real offset is larger. We measure it instead. For
+the x86-64 target, a GDB breakpoint inside \code{submit\_review()} and its frame
+information place \code{comment} at \code{[rbp-0x50]} and the saved return
+address at \code{[rbp+8]}, a gap of \textbf{88} bytes. For the 32-bit target,
+\code{find\_offset.py} sends a cyclic De~Bruijn pattern, lets the program crash
+on the garbage return address, and reads the faulting instruction pointer from
+the core dump; the 4-byte window that value matches is the offset, \textbf{84}
+bytes (64 bytes of buffer, other locals and alignment, and the 4-byte saved
+frame pointer). Measuring rather than guessing is what makes the exploits
+survive recompiles.
 
 \subsection{Stage 1: Classic Injection (x86-64)}
-Built with \code{-z execstack}, so the stack is mapped \code{rwxp}. The exploit
-avoids guessing the buffer's runtime address: it launches the target under GDB,
-breaks inside \code{submit\_review}, and reads the live address of
-\code{comment} and the live saved-return-address slot from the very process it
-then exploits. The measured offset is 88 bytes (\code{comment} at
-\code{[rbp-0x50]}, return address at \code{[rbp+8]}). The payload is
-\code{execve} shellcode, NOP padding, then the little-endian address of the
-buffer itself:
+Built with \code{-z execstack}, so the stack is mapped \code{rwxp};
+\code{readelf -l} confirms the \code{GNU\_STACK} segment carries \code{RWE}
+permissions. The hard part of the classic attack is knowing the buffer's exact
+runtime address, which shifts with the environment and \code{argv}. The exploit
+sidesteps the guess entirely. It launches the target under GDB through
+pwntools (\code{gdb.debug(api=True)}), breaks inside \code{submit\_review}, and
+reads the live address of \code{comment} and the live saved-return-address slot
+from the very process it then exploits. The offset is derived from GDB's frame
+information on each run, so it is exact for that run and no address is predicted.
+
+The payload has three parts (Table~\ref{tab:s1pay}): the \code{execve("/bin/sh")}
+shellcode, a NOP sled that fills the gap to the saved return address, and the
+little-endian address of the buffer itself written over that slot.
 \begin{lstlisting}[style=py]
 payload  = shellcode              # execve("/bin/sh")
 payload += b'\x90'*(off-len(sc))  # pad to offset 88
 payload += p64(comment_addr)      # saved RA -> buffer
 \end{lstlisting}
-\noindent GDB confirmed RIP entered the injected bytes.
+\noindent When \code{submit\_review()} returns, execution lands in the NOP sled,
+slides into the shellcode, and the executable stack lets it run. With a
+breakpoint on the \code{ret}, GDB showed the saved-return slot holding the
+buffer's own address and, after stepping past it, the instruction pointer inside
+the injected bytes. A harmless test payload (\code{mov eax, 0x2a; ret}) left
+\code{RAX = 0x2a}, which confirms the attacker-supplied code ran rather than any
+original instruction.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Region} & \textbf{Purpose} & \textbf{Bytes}\\
+\midrule
+shellcode & \code{execve("/bin/sh")} & $\approx$44\\
+NOP sled  & reach offset 88 & fill\\
+saved RA  & point back into the buffer & 8\\
+\bottomrule
+\end{tabular}
+\captionof{table}{Stage~1 payload layout (x86-64).}
+\label{tab:s1pay}
+\end{center}
 
 \subsection{Stage 2: NX Blocks Injection; ret2libc Recovers It (x86-64)}
 \fbox{\parbox{0.95\columnwidth}{\footnotesize\textbf{Status (placeholder).} The
@@ -301,29 +415,72 @@ added to Table~\ref{tab:results}.}}
 
 \vspace{4pt}
 Stage~2 rebuilds the same source with a single flag flipped,
-\code{-z noexecstack} (NX on), and shows two things. \textbf{(a) The defense
-works:} the exact Stage~1 payload now faults with \code{SIGSEGV} the instant the
-CPU tries to fetch the injected bytes. NX is enforcing W\^{}X here, with no
-source change. \textbf{(b) Code reuse defeats NX:} instead of injecting code, the
-return address is redirected into an existing libc function, with a fake frame
-supplying its argument:
+\code{-z noexecstack} (NX on). The \code{GNU\_STACK} segment now carries
+\code{RW} instead of \code{RWE}, so the pages backing the stack have their
+execute bit cleared. The stage shows two things.
+
+\textbf{(a) The defense works.} The exact Stage~1 payload is re-run unchanged.
+The overflow still overwrites the return address, and the \code{ret} still
+redirects control to the buffer, but the moment the CPU tries to fetch an
+instruction from a non-executable page it faults, and the process dies with
+\code{SIGSEGV}. This is W\^{}X enforcement in hardware: a page is writable or
+executable, never both, so injected stack code can no longer run. No source
+changed; one linker flag did this.
+
+\textbf{(b) Code reuse defeats NX.} Instead of injecting code, the return address
+is redirected into an existing libc function. Because that target is real,
+legitimately executable code, NX has no objection. The overflow lays down a fake
+call frame for \code{system()}: the function address in the return slot, a
+return address for \code{system()} to use when it finishes, and the argument
+pointer (Table~\ref{tab:ret2libc}).
 \begin{lstlisting}[style=py]
 payload  = b'A'*OFFSET   # pad to saved RA
 payload += p32(system)   # ret INTO system()
 payload += p32(exit)     # system()'s return addr
 payload += p32(binsh)    # arg -> "/bin/sh"
 \end{lstlisting}
-\noindent Nothing on the stack executes as code, so NX never fires. (Shown in
-the 32-bit argument layout; the x86-64 variant loads the argument into RDI via a
-\code{pop rdi; ret} gadget.) This is the split the project turns on: NX stops
+\noindent Nothing on the stack executes as code, so NX never fires. The layout
+shown is the 32-bit calling convention, where arguments are passed on the stack.
+The x86-64 variant works the same way but passes the argument in the \code{RDI}
+register, which the chain loads with a \code{pop rdi; ret} gadget before jumping
+to \code{system()}. This is the split the project turns on: NX stops
 \textbf{injection} but not \textbf{reuse}, which is what motivates the general
 technique in Stage~3.
 
-\subsection{Stage 3: Full ROP, ASLR Bypass, mprotect (x86-32)}
-Stage~3 uses a 32-bit build (stack-passed syscall arguments keep the layout
-teachable). The offset, 84 bytes, is found with a cyclic De Bruijn pattern. The
-main exploit builds the \code{execve("/bin/sh",0,0)} syscall by hand from four
-gadgets:
+\begin{center}\footnotesize
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Stack slot (low to high)} & \textbf{Meaning}\\
+\midrule
+\code{'A'} $\times$ OFFSET & padding to the saved RA\\
+\code{\&system} & \code{ret} jumps into \code{system()}\\
+\code{\&exit} & where \code{system()} returns\\
+\code{\&"/bin/sh"} & \code{system()}'s argument\\
+\bottomrule
+\end{tabular}
+\captionof{table}{Return-to-libc fake frame (x86-32).}
+\label{tab:ret2libc}
+\end{center}
+
+\subsection{Stage 3: Full ROP (x86-32)}
+Return-to-libc jumps into one whole function. Return-oriented programming
+generalizes that idea: instead of a convenient function, the attacker chains
+short existing instruction sequences, called \emph{gadgets}, each ending in
+\code{ret}. The overflow writes a sequence of addresses onto the stack; each
+\code{ret} pops the next address and transfers control to it, so the gadgets run
+one after another. Nothing on the stack is executed as code, so NX never fires.
+Stage~3 uses a 32-bit build because its syscalls take arguments in registers set
+from the stack, which keeps the chain readable.
+
+On 32-bit Linux a system call is made by loading registers and executing
+\code{int 0x80}: \code{eax} holds the call number, and \code{ebx}, \code{ecx},
+\code{edx} hold the first three arguments. For \code{execve("/bin/sh", NULL,
+NULL)} that is \code{eax=0x0b}, \code{ebx} pointing at the string, and
+\code{ecx=edx=0}. We find gadgets that load each register with ROPgadget, for
+example searching libc for \code{pop ecx ; pop edx ; ret} and \code{pop ebx ;
+ret}, and a \code{int 0x80} instruction already present in an executable page.
+The \code{"/bin/sh"} string already lives inside libc, so no string has to be
+planted. The chain assembles the syscall by hand:
 \begin{lstlisting}[style=py]
 payload  = b'A'*OFFSET
 payload += p32(pop_ecx_edx)+p32(0)+p32(0) # ecx,edx=0
@@ -331,22 +488,116 @@ payload += p32(pop_ebx)+p32(binsh)        # ebx=&sh
 payload += p32(pop_eax)+p32(0xb)          # eax=11
 payload += p32(int80)                     # int 0x80
 \end{lstlisting}
-\noindent Each \code{ret} pops the next gadget's address; every instruction that
-runs lives inside libc, which is legitimately executable, so NX has nothing to
-object to. Two further prototypes extend the idea:
-\begin{itemize}
-  \item \textbf{Defeating ASLR.} With ASLR on, a first stage calls
-    \code{puts()} on a GOT entry to leak a real libc address, computes the base
-    (\code{libc.address = leaked\_puts - sym['puts']}), and sends the chain
-    resolved against it. It succeeds on repeated runs, each with a different
-    base.
-  \item \textbf{Runtime W\^{}X bypass.} A ROP chain calls \code{mprotect()} to
-    mark a page RWX, then jumps into shellcode placed there. This shows NX can
-    be undone at runtime given the right callable function.
-\end{itemize}
+\noindent Each gadget loads one register and returns into the next, so the four
+gadgets cooperate to set up the syscall (Table~\ref{tab:gadgets}). After the
+fourth runs, the registers describe \code{execve("/bin/sh", 0, 0)} and the kernel
+replaces the process with a shell. Every instruction executed lives inside libc,
+which is legitimately executable; the stack holds only addresses and data, so NX
+governs nothing the chain does.
+
+\begin{table*}[t]
+  \centering
+  \caption{The four-gadget \code{execve} chain. Each \code{ret} drives the next gadget; the register state at the bottom describes the syscall.}
+  \label{tab:gadgets}
+  \small
+  \begin{tabularx}{\textwidth}{@{}c l l X@{}}
+    \toprule
+    \textbf{\#} & \textbf{Gadget} & \textbf{Loads} & \textbf{Meaning}\\
+    \midrule
+    1 & \code{pop ecx ; pop edx ; ret} & \code{ecx=0, edx=0} & \code{argv} and \code{envp} are NULL\\
+    2 & \code{pop ebx ; ret} & \code{ebx=\&"/bin/sh"} & path to execute (string inside libc)\\
+    3 & \code{pop eax ; ret} & \code{eax=0x0b} & syscall number for \code{execve}\\
+    4 & \code{int 0x80} & --- & hand control to the kernel $\rightarrow$ shell\\
+    \bottomrule
+  \end{tabularx}
+\end{table*}
+
+A simpler return-to-libc variant (one jump into \code{system("/bin/sh")}) is
+included for comparison, and \code{exploit\_hardcoded.py} freezes the gadget
+addresses to show the next problem directly: with ASLR enabled those fixed
+addresses no longer point into libc and the exploit crashes.
+
+\subsection{Defeating ASLR with an Information Leak}
+Address Space Layout Randomization loads libc at a different base on every run,
+so the fixed gadget and function addresses used above stop being valid. ASLR
+randomizes only the base, however; the \emph{offsets} of symbols within libc are
+fixed, so learning one real runtime address locates the entire library. Because
+PIE is off, the program's own Procedure Linkage Table (PLT) and Global Offset
+Table (GOT) sit at fixed addresses we can use as a starting point. The bypass is
+two stages. First, an overflow calls \code{puts(puts@GOT)}: the GOT entry holds
+the real runtime address of \code{puts()}, so the program prints it for us, then
+returns to \code{main} so a second overflow is possible. Subtracting the known
+offset of \code{puts} within libc yields the base. The second overflow sends the
+execve chain with every address resolved against that base.
+\begin{lstlisting}[style=py]
+# 1) leak: print the real puts() address
+pay = b'A'*84 + p32(puts_plt) + p32(main)
+pay +=         p32(puts_got)   # arg = &puts@GOT
+leak = u32(p.recvline()[:4])
+libc.address = leak - libc.sym['puts']
+# 2) resend the execve chain at real addresses
+\end{lstlisting}
+\noindent Reading the base from \code{/proc} would only work locally, so the
+exploit recovers it from program output instead, which is what a remote attacker
+would do. It succeeds on repeated runs, each with a different base.
+
+\subsection{Re-enabling Execution with mprotect}
+NX is a permission bit on a memory page, and \code{mprotect()} is the system call
+a process uses to change a page's permissions. A page is the unit the hardware
+protects, typically 4096 (\code{0x1000}) bytes, and \code{mprotect()} requires a
+page-aligned address, which the exploit obtains by clearing the low twelve bits
+of a scratch address (\code{page = scratch \& \textasciitilde 0xfff}). The chain
+calls three real libc functions in turn: \code{read()} copies shellcode into the
+scratch page, \code{mprotect(page, 0x1000, RWX)} marks that page readable,
+writable, and executable, and a final return jumps into the now-executable page.
+\begin{lstlisting}[style=py]
+rop.read(0, scratch, len(shellcode))  # write code in
+rop.mprotect(page, 0x1000, PROT_RWX)  # flip to RWX
+rop.raw(scratch)                      # jump into it
+\end{lstlisting}
+\noindent This is a runtime W\^{}X bypass. NX is not broken by a trick; the
+process is allowed to change the permissions of its own memory, and a chain that
+can call \code{mprotect()} with chosen arguments can mark a page executable and
+run injected code again. It is the clearest argument for why NX cannot be the
+only defense.
+
+\subsection{Control Experiments}
+Two scripts in the repository are negative controls, included so that each
+defense's effect is shown rather than asserted. \code{nx\_shellcode\_fails.py}
+runs the stack-injection attack against the NX-enabled 32-bit binary. It places
+shellcode on the stack exactly as Stage~1 does, and the process ends in
+\code{SIGSEGV} the moment control reaches the stack bytes. This is the same
+outcome as Stage~2a on the x86-64 target and confirms, on the binary that
+Stage~3 then exploits, that the stack really is non-executable; the ROP result
+that follows cannot be dismissed as the stack having been executable after all.
+\code{exploit\_hardcoded.py} is the second control. It is the return-to-libc
+attack with the libc addresses frozen into the script. With ASLR disabled it
+succeeds, and with ASLR enabled the same frozen addresses no longer point into
+libc and the process crashes. Running it both ways makes ASLR's contribution
+visible as a before-and-after, and it is the direct motivation for the
+leak-based bypass that recovers those addresses at runtime. Together the controls
+pin down what each mitigation does on its own, which is what lets the positive
+results be read as evidence about a single variable at a time.
+
+\subsection{Reproducibility and Verification}
+Every build is confirmed before it is attacked. \code{make checksec} reads the
+binary with \code{readelf} and prints the architecture, whether
+\code{GNU\_STACK} is executable, whether \code{\_\_stack\_chk\_fail} is present
+(the canary), and whether the image is position independent. A run is only
+meaningful once its configuration is printed, so each result in
+Section~\ref{sec:results} can be tied to a known build rather than an assumed
+one. For the demonstrations, ASLR is disabled per process (\code{aslr=False} in
+pwntools, or \code{setarch -R}) so that addresses are stable while the mechanism
+is explained, and it is re-enabled only for the leak experiment, where defeating
+it is the point. These are lab conditions for teaching, not a claim that the
+addresses would hold under a normal, fully randomized system. The environment is
+a single isolated SEED Ubuntu~20.04 virtual machine (glibc~2.31) on an x86-64
+host with 32-bit multilib installed, and all payloads are harmless: a local
+\code{/bin/sh} on a process we own, or shellcode that only sets a register.
 
 % =====================================================================
 \section{Experimental Evaluation and Results}
+\label{sec:results}
 
 \subsection{Setup and Methodology}
 All tests run on an isolated SEED Ubuntu 20.04 VM (glibc 2.31), x86-64 host with
